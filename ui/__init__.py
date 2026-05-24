@@ -1,0 +1,1 @@
+"""UI modülü — Streamlit arayüzü."""

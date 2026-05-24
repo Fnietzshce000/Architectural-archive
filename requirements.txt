@@ -1,0 +1,13 @@
+telethon>=1.36
+chromadb>=0.5
+open-clip-torch>=2.24
+streamlit>=1.38
+imagehash>=4.3
+Pillow>=10.0
+pydantic-settings>=2.0
+tqdm>=4.66
+numpy>=1.26
+torch>=2.0
+torchvision
+requests
+python-dotenv
