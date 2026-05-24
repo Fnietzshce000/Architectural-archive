@@ -1,10 +1,10 @@
 """
-İndeksleme Pipeline — Dedublikasyon + CLIP vektörleştirme + ChromaDB kayıt.
+Indexing Pipeline — Deduplication + CLIP vectorization + ChromaDB storage.
 
-Kullanım:
-    python scripts/run_indexer.py                 # Tam pipeline
-    python scripts/run_indexer.py --skip-dedup    # Dedublikasyonu atla
-    python scripts/run_indexer.py --reset         # İndeksi sıfırla ve yeniden oluştur
+Usage:
+    python scripts/run_indexer.py                 # Full pipeline
+    python scripts/run_indexer.py --skip-dedup    # Skip deduplication
+    python scripts/run_indexer.py --reset         # Reset index and rebuild
 """
 import argparse
 import json
@@ -14,7 +14,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-# Proje kökünü path'e ekle
+# Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -33,9 +33,32 @@ logging.basicConfig(
 logger = logging.getLogger("run_indexer")
 
 
+# tqdm wrapper that also logs progress milestones to the log file
+class LoggingTqdm(tqdm):
+    """tqdm subclass that logs progress at regular intervals."""
+    def __init__(self, *args, log_interval: int = 10, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._log_interval = log_interval
+        self._last_logged_pct = -1
+
+    def update(self, n=1):
+        super().update(n)
+        if self.total:
+            pct = int(100 * self.n / self.total)
+            if pct >= self._last_logged_pct + self._log_interval:
+                self._last_logged_pct = pct
+                elapsed = self.format_dict.get("elapsed", 0)
+                rate = self.format_dict.get("rate", 0)
+                eta = (self.total - self.n) / rate if rate else 0
+                logger.info(
+                    f"Progress: {pct}% ({self.n:,}/{self.total:,}) "
+                    f"| Speed: {rate:.1f} it/s | ETA: {eta:.0f}s"
+                )
+
+
 def load_metadata(data_dir: Path) -> dict:
     """
-    Metadata dosyasından mesaj bilgilerini yükler.
+    Load message metadata from JSONL file.
     Returns: {image_path: TelegramMessage}
     """
     metadata_file = data_dir / "messages_metadata.jsonl"
@@ -51,7 +74,7 @@ def load_metadata(data_dir: Path) -> dict:
                         if msg.image_path:
                             metadata_map[msg.image_path] = msg
                     except (json.JSONDecodeError, Exception) as e:
-                        logger.warning(f"Metadata satırı okunamadı: {e}")
+                        logger.warning(f"Failed to parse metadata line: {e}")
     return metadata_map
 
 
@@ -60,71 +83,70 @@ def main(args):
     data_dir = settings.get_data_path()
     images_dir = settings.get_images_path()
 
-    logger.info("🚀 İndeksleme pipeline başlatılıyor...")
-    logger.info(f"   Görsel dizini: {images_dir}")
-    logger.info(f"   ChromaDB: {settings.chroma_db_path}")
+    logger.info("🚀 Starting indexing pipeline...")
+    logger.info(f"   Image directory: {images_dir}")
+    logger.info(f"   ChromaDB path:   {settings.chroma_db_path}")
 
-    # ── Adım 1: Metadata yükleme ──
-    logger.info("\n📋 Adım 1: Metadata yükleniyor...")
+    # ── Step 1: Load metadata ──
+    logger.info("\n📋 Step 1: Loading metadata...")
     metadata_map = load_metadata(data_dir)
-    logger.info(f"   {len(metadata_map)} mesaj metadata'sı bulundu")
+    logger.info(f"   Found {len(metadata_map):,} message metadata entries")
 
-    # ── Adım 2: Görsel tarama ve doğrulama ──
-    logger.info("\n📁 Adım 2: Görseller taranıyor...")
-    processor = ImageProcessor()
+    # ── Step 2: Scan and validate images (with cache) ──
+    logger.info("\n📁 Step 2: Scanning images (cached)...")
+    processor = ImageProcessor(cache_dir=data_dir)
     all_images = processor.scan_directory(images_dir)
 
     if not all_images:
         logger.error(
-            "❌ Hiç görsel bulunamadı! Önce scraper'ı çalıştırın:\n"
+            "❌ No images found! Run the scraper first:\n"
             "   python scripts/run_scraper.py"
         )
         return
 
-    # ── Adım 3: Dedublikasyon ──
+    # ── Step 3: Deduplication ──
     if not args.skip_dedup:
-        logger.info("\n🔍 Adım 3: Dedublikasyon yapılıyor...")
+        logger.info("\n🔍 Step 3: Running deduplication...")
         dedup = ImageDeduplicator(
             hash_db_path=data_dir / "hash_db.json",
             dhash_threshold=5,
             phash_threshold=8,
         )
         unique_images, duplicate_images = dedup.process_directory(images_dir)
-        logger.info(f"   ✅ {len(unique_images)} benzersiz, {len(duplicate_images)} duplikat")
+        logger.info(f"   ✅ {len(unique_images):,} unique, {len(duplicate_images):,} duplicates")
     else:
-        logger.info("\n⏭️ Adım 3: Dedublikasyon atlandı")
+        logger.info("\n⏭️ Step 3: Deduplication skipped")
         unique_images = all_images
 
-    # ── Adım 4: ChromaDB hazırlık ──
-    logger.info(f"\n📦 Adım 4: ChromaDB hazırlanıyor...")
+    # ── Step 4: ChromaDB setup ──
+    logger.info("\n📦 Step 4: Preparing ChromaDB...")
     store = ChromaStore(
         db_path=settings.chroma_db_path,
         collection_name=settings.get_collection_name(),
     )
 
     if args.reset:
-        logger.info("   🔄 İndeks sıfırlanıyor...")
+        logger.info("   🔄 Resetting index...")
         store.reset()
 
-    # Zaten indekslenmiş görselleri filtrele
+    # Filter out already-indexed images
     existing_ids = set(store.get_all_ids())
     images_to_index = []
     for img_path in unique_images:
-        doc_id = Path(img_path).stem  # ör: "123_456"
+        doc_id = Path(img_path).stem
         if doc_id not in existing_ids:
             images_to_index.append(img_path)
 
     if not images_to_index:
-        logger.info("   ✅ Tüm görseller zaten indekslenmiş!")
-        logger.info(f"   Toplam kayıt: {store.get_count()}")
+        logger.info("   ✅ All images already indexed!")
+        logger.info(f"   Total records: {store.get_count():,}")
         return
 
-    logger.info(f"   {len(images_to_index)} yeni görsel indekslenecek")
+    logger.info(f"   {len(images_to_index):,} new images to index")
 
-    # ── Adım 5: CLIP vektörleştirme ──
-    logger.info(f"\n🧠 Adım 5: CLIP ile vektörleştirme ({settings.clip_model_name})...")
+    # ── Step 5: CLIP vectorization ──
+    logger.info(f"\n🧠 Step 5: Encoding with CLIP ({settings.clip_model_name})...")
 
-    # Batch encode
     vectors = encode_images_batch(
         image_paths=images_to_index,
         batch_size=32,
@@ -132,8 +154,8 @@ def main(args):
         pretrained=settings.clip_pretrained,
     )
 
-    # ── Adım 6: ChromaDB'ye yazma ──
-    logger.info("\n💾 Adım 6: ChromaDB'ye kaydediliyor...")
+    # ── Step 6: Write to ChromaDB ──
+    logger.info("\n💾 Step 6: Saving to ChromaDB...")
 
     doc_ids = []
     embeddings = []
@@ -143,10 +165,11 @@ def main(args):
 
     from config import MetadataSchema
 
-    for img_path, vector in tqdm(
+    for img_path, vector in LoggingTqdm(
         zip(images_to_index, vectors),
         total=len(images_to_index),
-        desc="ChromaDB kayıt",
+        desc="ChromaDB write",
+        log_interval=10,
     ):
         if vector is None:
             skipped += 1
@@ -169,14 +192,12 @@ def main(args):
                 MetadataSchema.MODEL_NAME: settings.clip_model_name,
                 MetadataSchema.SCHEMA_VERSION_KEY: MetadataSchema.CURRENT_SCHEMA_VERSION,
             }
-            # file_names ek alanı (ChromaDB list kabul etmez, string'e çevir)
             file_names = getattr(meta, "file_names", [])
             if file_names:
                 import json as _json
                 metadata["file_names"] = _json.dumps(file_names, ensure_ascii=False)
             document_text = meta.caption
         else:
-            # Metadata yoksa minimal kayıt
             metadata = {
                 MetadataSchema.IMAGE_PATH: img_path,
                 MetadataSchema.DEEP_LINK: "",
@@ -193,7 +214,7 @@ def main(args):
         metadatas.append(metadata)
         documents.append(document_text)
 
-    # Batch yazma
+    # Batch write
     if doc_ids:
         store.add_batch(
             doc_ids=doc_ids,
@@ -204,22 +225,22 @@ def main(args):
         )
 
     logger.info(f"\n{'='*50}")
-    logger.info(f"🎉 İndeksleme tamamlandı!")
-    logger.info(f"   Yeni kayıt: {len(doc_ids)}")
-    logger.info(f"   Atlanan: {skipped}")
-    logger.info(f"   Toplam indeks boyutu: {store.get_count()}")
-    logger.info(f"   Sonraki adım: streamlit run ui/app.py")
+    logger.info(f"🎉 Indexing complete!")
+    logger.info(f"   New records:      {len(doc_ids):,}")
+    logger.info(f"   Skipped (errors): {skipped:,}")
+    logger.info(f"   Total index size: {store.get_count():,}")
+    logger.info(f"   Next step: streamlit run ui/app.py")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="3D Model İndeksleme Pipeline")
+    parser = argparse.ArgumentParser(description="3D Model Indexing Pipeline")
     parser.add_argument(
         "--skip-dedup", action="store_true",
-        help="Dedublikasyon adımını atla"
+        help="Skip the deduplication step"
     )
     parser.add_argument(
         "--reset", action="store_true",
-        help="ChromaDB indeksini sıfırla ve yeniden oluştur"
+        help="Reset ChromaDB index and rebuild from scratch"
     )
     args = parser.parse_args()
 
